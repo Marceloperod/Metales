@@ -11,6 +11,7 @@ import io
 import json
 import re
 import sys
+import time
 import urllib.request
 from datetime import datetime, timezone
 from html import unescape
@@ -106,7 +107,19 @@ def fetch_silver_stooq():
 
 
 def fetch_silver_yahoo():
-    data = json.loads(get("https://query1.finance.yahoo.com/v8/finance/chart/SI=F?range=5y&interval=1d"))
+    data, last_err = None, None
+    for attempt in range(3):
+        for host in ("query2", "query1"):
+            try:
+                data = json.loads(get(f"https://{host}.finance.yahoo.com/v8/finance/chart/SI=F?range=5y&interval=1d"))
+                break
+            except Exception as e:  # noqa: BLE001
+                last_err = e
+        if data:
+            break
+        time.sleep(5 * (attempt + 1))
+    if not data:
+        raise RuntimeError(f"yahoo: {last_err}")
     res = data["chart"]["result"][0]
     rows = []
     for ts, c in zip(res["timestamp"], res["indicators"]["quote"][0]["close"]):
@@ -116,6 +129,14 @@ def fetch_silver_yahoo():
     if not rows:
         raise RuntimeError("yahoo sin datos")
     return rows
+
+
+def fetch_silver_goldapi():
+    """Solo el precio spot actual (sin histórico); se guarda como el dato del día."""
+    data = json.loads(get("https://api.gold-api.com/price/XAG"))
+    price = float(data["price"])
+    d = (data.get("updatedAt") or datetime.now(timezone.utc).isoformat())[:10]
+    return [{"date": d, "close": round(price, 3)}]
 
 
 def merge(old, new, key="date"):
@@ -143,13 +164,19 @@ def main():
         }
 
     old = prev_m.get("silver", {}).get("history", [])
-    hist, src = old, "—"
-    for fn, label in ((fetch_silver_stooq, "XAG/USD (stooq.com)"), (fetch_silver_yahoo, "COMEX SI=F (Yahoo Finance)")):
+    hist, src = old, prev_m.get("silver", {}).get("source", "—")
+    silver_errs = []
+    for fn, label in ((fetch_silver_yahoo, "COMEX SI=F (Yahoo Finance)"),
+                      (fetch_silver_stooq, "XAG/USD (stooq.com)"),
+                      (fetch_silver_goldapi, "XAG/USD spot (gold-api.com)")):
         try:
             hist, src = merge(old, fn()), label
+            silver_errs = []
             break
         except Exception as e:  # noqa: BLE001
-            out["errors"].append(f"Plata {label}: {e}")
+            silver_errs.append(f"Plata {label}: {e}")
+            print("AVISO:", silver_errs[-1])
+    out["errors"] += silver_errs
     out["metals"]["silver"] = {"name": "Plata", "unit": "USD/oz", "source": src, "history": hist}
 
     if not any(m["history"] for m in out["metals"].values()):
